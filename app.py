@@ -1,7 +1,7 @@
-import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
@@ -41,9 +41,6 @@ def extract_first_transaction(original, txn_type):
     - payout: original['data']['transactions']
     - payin: original['transactions']
     """
-    if not isinstance(original, dict):
-        return None
-
     if txn_type == "payout":
         txns = (original.get("data") or {}).get("transactions") or []
     else:
@@ -68,8 +65,6 @@ def normalize_status(status):
 
 
 def pick_any(d, keys, default=None):
-    if not isinstance(d, dict):
-        return default
     for k in keys:
         if k in d and d[k] not in (None, ""):
             return d[k]
@@ -78,7 +73,6 @@ def pick_any(d, keys, default=None):
 
 @app.get("/")
 def health():
-    # Railway health check ke liye simple OK route
     return jsonify({"ok": True, "service": "sahulatpay-status-proxy"}), 200
 
 
@@ -88,8 +82,8 @@ def status_proxy():
     Proxy endpoint used by HTML:
     /status?id=<merchantTransactionId>&type=payout|payin
     """
-    order_id = (request.args.get("id") or "").strip()
-    txn_type = (request.args.get("type") or "payout").strip().lower()
+    order_id = request.args.get("id", "").strip()
+    txn_type = request.args.get("type", "payout").strip().lower()
 
     if not order_id:
         return jsonify({"ok": False, "error": "id is required"}), 400
@@ -111,30 +105,27 @@ def status_proxy():
         except Exception:
             original = {"raw": r.text}
 
-        txn = extract_first_transaction(original, txn_type)
-        txn = txn or {}
+        txn = extract_first_transaction(
+            original if isinstance(original, dict) else {}, txn_type
+        )
+        txn = txn if isinstance(txn, dict) else {}
 
-        raw_status = txn.get("status")
+        raw_status = txn.get("status") if txn else None
         status = normalize_status(raw_status)
 
         txn_id = pick_any(txn, ["transactionId", "txnId", "id"], default="N/A")
         txn_date = pick_any(
-            txn,
-            ["createdAt", "created_at", "date_time", "date", "timestamp"],
-            default="N/A",
+            txn, ["createdAt", "created_at", "date_time", "date", "timestamp"], default="N/A"
         )
 
-        amount = pick_any(
-            txn,
-            ["amount", "totalAmount", "txnAmount", "balance"],
-            default=None,
-        )
+        amount = pick_any(txn, ["amount", "totalAmount", "txnAmount", "balance"], default=None)
         currency = pick_any(txn, ["currency", "ccy"], default="PKR")
 
+        # example merchant field from your screenshot
         merchant = None
-        jcm = txn.get("jazzCashMerchant")
-        if isinstance(jcm, dict):
-            merchant = jcm.get("merchant_of")
+        if isinstance(txn.get("jazzCashMerchant"), dict):
+            merchant = txn["jazzCashMerchant"].get("merchant_of")
+
         merchant = merchant or pick_any(txn, ["merchantName"], default=None)
 
         result = {
@@ -142,31 +133,176 @@ def status_proxy():
             "status_code": r.status_code,
             "order_id": order_id,
             "type": txn_type,
+            # Summary block (UI ke liye easy)
             "summary": {
-                "status": status,   # COMPLETED / FAILED / PENDING / ...
-                "txn_id": txn_id,   # provider txn id
+                "status": status,  # COMPLETED / FAILED / PENDING / ...
+                "txn_id": txn_id,  # provider txn id
                 "date": txn_date,
                 "amount": amount,
                 "currency": currency,
                 "merchant": merchant,
             },
-            # full but sanitized
+            # Full response but sanitized
             "data": sanitize(original)
             if isinstance(original, (dict, list))
             else original,
         }
 
-        # Even if SahulatPay 500/400 de, hum JSON bhej rahe hain
-        return jsonify(result), r.status_code or 200
+        return jsonify(result), r.status_code
 
     except requests.exceptions.Timeout:
         return jsonify({"ok": False, "error": "timeout"}), 504
     except Exception as e:
-        # yahan exception bhi JSON me wrap ho raha hai, process crash nahi karega
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# 🔥 NEW: Bulk status endpoint
+@app.post("/bulk-status")
+def bulk_status():
+    """
+    Bulk status checker.
+
+    Request (JSON body):
+    {
+      "type": "payout" | "payin",
+      "ids": ["359884596", "87703010204162", ...]
+    }
+
+    Response:
+    {
+      "ok": true,
+      "type": "payout",
+      "count": 3,
+      "results": [
+        {
+          "order_id": "359884596",
+          "type": "payout",
+          "status": "COMPLETED",
+          "raw_status": "Completed",
+          "txn_id": "202601201768897307262781",
+          "processed_at": "2026-01-20T08:21:46.665Z",
+          "status_code": 200,
+          "note": ""
+        },
+        ...
+      ]
+    }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    txn_type = (data.get("type") or "payout").strip().lower()
+    ids = data.get("ids") or []
+
+    if txn_type not in ("payout", "payin"):
+      return jsonify({"ok": False, "error": "type must be payout or payin"}), 400
+
+    if not isinstance(ids, list) or not ids:
+      return jsonify({"ok": False, "error": "ids must be a non-empty list"}), 400
+
+    base_url = SAHULAT_PAYOUT_URL if txn_type == "payout" else SAHULAT_PAYIN_URL
+    results = []
+
+    for raw_id in ids:
+        order_id = str(raw_id).strip()
+        if not order_id:
+            continue
+
+        try:
+            r = requests.get(
+                base_url,
+                params={"merchantTransactionId": order_id},
+                timeout=15,
+            )
+            status_code = r.status_code
+
+            try:
+                original = r.json()
+            except Exception:
+                original = {}
+
+            txn = extract_first_transaction(
+                original if isinstance(original, dict) else {}, txn_type
+            )
+
+            if not txn:
+                # koi transaction mila hi nahi
+                results.append(
+                    {
+                        "order_id": order_id,
+                        "type": txn_type,
+                        "status": "NOT_IN_BO",
+                        "raw_status": None,
+                        "txn_id": "N/A",
+                        "processed_at": "N/A",
+                        "status_code": status_code,
+                        "note": "NOT_IN_BO",
+                    }
+                )
+                continue
+
+            raw_status = txn.get("status")
+            status = normalize_status(raw_status)
+
+            txn_id = pick_any(
+                txn,
+                ["transactionId", "txnId", "id"],
+                default="N/A",
+            )
+            txn_date = pick_any(
+                txn,
+                ["createdAt", "created_at", "date_time", "date", "timestamp"],
+                default="N/A",
+            )
+
+            results.append(
+                {
+                    "order_id": order_id,
+                    "type": txn_type,
+                    "status": status,
+                    "raw_status": raw_status,
+                    "txn_id": txn_id,
+                    "processed_at": txn_date,
+                    "status_code": status_code,
+                    "note": "",
+                }
+            )
+
+        except requests.exceptions.Timeout:
+            results.append(
+                {
+                    "order_id": order_id,
+                    "type": txn_type,
+                    "status": "TIMEOUT",
+                    "raw_status": None,
+                    "txn_id": "N/A",
+                    "processed_at": "N/A",
+                    "status_code": 504,
+                    "note": "TIMEOUT",
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "order_id": order_id,
+                    "type": txn_type,
+                    "status": "ERROR",
+                    "raw_status": None,
+                    "txn_id": "N/A",
+                    "processed_at": "N/A",
+                    "status_code": 500,
+                    "note": str(e),
+                }
+            )
+
+    return jsonify(
+        {
+            "ok": True,
+            "type": txn_type,
+            "count": len(results),
+            "results": results,
+        }
+    ), 200
+
+
 if __name__ == "__main__":
-    # Railway apna PORT env deta hai, usko use karo
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # run: python app.py
+    app.run(host="0.0.0.0", port=5000, debug=True)
