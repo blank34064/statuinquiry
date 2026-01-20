@@ -6,7 +6,7 @@ import time
 
 app = Flask(__name__)
 
-# ✅ CORS: allow all origins (simple) — production me specific origin de sakte ho
+# CORS wide-open (simple)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 SAHULAT_PAYOUT_URL = "https://server.sahulatpay.com/disbursement/tele"
@@ -83,8 +83,6 @@ def call_sahulat(order_id: str, txn_type: str):
 
     txn_id = pick_any(txn, ["transactionId", "txnId", "id"], default="N/A")
     txn_date = pick_any(txn, ["createdAt", "created_at", "date_time", "date", "timestamp"], default="N/A")
-
-    # updatedAt bhi try karo
     processed_at = pick_any(txn, ["updatedAt", "updated_at"], default=None) or txn_date
 
     return {
@@ -102,7 +100,7 @@ def call_sahulat(order_id: str, txn_type: str):
         "original_sanitized": sanitize(original) if isinstance(original, (dict, list)) else original
     }
 
-# ✅ Preflight handler (OPTIONS)
+# global CORS headers (extra safety)
 @app.after_request
 def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -147,34 +145,31 @@ def status_proxy():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ✅ NEW: Bulk Status Endpoint
-@app.route("/bulk-status", methods=["POST", "OPTIONS"])
-def bulk_status():
+# ✅ NEW: GET-based bulk endpoint (no preflight for browser)
+@app.route("/bulk-status-get", methods=["GET", "OPTIONS"])
+def bulk_status_get():
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    body = request.get_json(silent=True) or {}
-    txn_type = str(body.get("type", "payout")).strip().lower()
-    ids = body.get("ids") or []
+    raw_ids = request.args.get("ids", "").strip()
+    txn_type = request.args.get("type", "payout").strip().lower()
 
     if txn_type not in ("payout", "payin"):
         return jsonify({"ok": False, "error": "type must be payout or payin"}), 400
 
-    if not isinstance(ids, list) or len(ids) == 0:
-        return jsonify({"ok": False, "error": "ids must be a non-empty list"}), 400
+    # ids comma-separated string -> list
+    ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
 
-    # safety: limit
+    if not ids:
+        return jsonify({"ok": False, "error": "no ids provided"}), 400
+
     if len(ids) > 5000:
         return jsonify({"ok": False, "error": "Too many ids. Max 5000 per request."}), 400
 
     results = []
     started = time.time()
 
-    for i, raw_id in enumerate(ids, start=1):
-        order_id = str(raw_id).strip()
-        if not order_id:
-            continue
-
+    for order_id in ids:
         try:
             out = call_sahulat(order_id, txn_type)
             status = out["summary"]["status"]
@@ -200,7 +195,6 @@ def bulk_status():
                 "status_code": out["status_code"],
                 "note": note
             })
-
         except requests.exceptions.Timeout:
             results.append({
                 "order_id": order_id,
